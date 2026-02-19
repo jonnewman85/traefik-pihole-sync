@@ -111,6 +111,15 @@ PIHOLE_PASSWORD=... python3 sync.py --rollback /opt/traefik-dns-sync/backups/192
 
 The script only manages DNS entries pointing to `TRAEFIK_IP`. Manual entries pointing to other IPs are never touched.
 
+## Requirements
+
+- **Python 3.6+** — uses only the standard library (no `pip install` needed)
+- **Pi-hole v6** — uses the v6 REST API (`/api/config/dns/hosts`). Not compatible with Pi-hole v5, which used `/etc/pihole/custom.list` and had no REST API for DNS management
+- **Traefik v2 or v3** — any version that exposes `/api/http/routers` with `Host()` rules
+- **Traefik API access** — the API must be reachable from wherever the script runs (localhost if on the same host)
+- **Pi-hole application password** — generated in the Pi-hole web UI under Settings → API. Requires `webserver.api.app_sudo` enabled for write access
+- **Network access** — the script needs HTTP(S) access to both the Traefik API and all Pi-hole instances
+
 ## How This Compares
 
 Other scripts that solve this problem tend to be Docker-first Go applications with built-in schedulers. This script takes a different approach:
