@@ -14,6 +14,8 @@ When services are added or removed behind Traefik, this script polls the Traefik
 - **Backup & rollback** — snapshots Pi-hole DNS state before every sync, with manual rollback via `--rollback`
 - **Dry run mode** — preview changes without applying
 - **Structured logging** — clear summaries of what changed
+- **Error handling** — retry with backoff, per-instance resilience, distinct exit codes, session cleanup
+- **Conflict resolution** — detects and replaces existing DNS entries that point to the wrong IP
 
 ## How It Works
 
@@ -71,6 +73,8 @@ All configuration is via environment variables:
 | `BACKUP_RETAIN` | `10` | Backups to keep per Pi-hole host |
 | `DRY_RUN` | `false` | Preview changes without applying |
 | `DEBUG` | *(unset)* | Enable debug logging |
+| `RETRY_ATTEMPTS` | `3` | Number of retry attempts for failed API requests |
+| `RETRY_BACKOFF_BASE` | `2.0` | Base for exponential backoff (seconds) |
 
 ## Pi-hole Setup
 
@@ -109,9 +113,33 @@ PIHOLE_PASSWORD=... DRY_RUN=true python3 sync.py --rollback /opt/traefik-dns-syn
 PIHOLE_PASSWORD=... python3 sync.py --rollback /opt/traefik-dns-sync/backups/192.168.1.2_2026-02-19T221000Z.json
 ```
 
+## Error Handling
+
+The script is designed to keep running reliably in unattended cron environments:
+
+- **Retry with backoff** — failed API requests are retried up to 3 times (configurable) with exponential backoff. Only network errors and 5xx responses are retried; 4xx errors fail immediately.
+- **Per-instance resilience** — if one Pi-hole is unreachable or auth fails, the script logs the error and continues syncing to the remaining instances instead of aborting.
+- **Traefik unavailable** — if the Traefik API is down or returns invalid data, the script exits cleanly without touching the cache, so the next run will retry.
+- **Session cleanup** — Pi-hole API sessions are cleaned up (`DELETE /api/auth`) after every sync, even if errors occur.
+- **Exit codes** — `0` success, `1` configuration error, `2` Traefik unreachable, `3` one or more Pi-hole instances failed. Useful for cron alerting.
+
+## Conflict Resolution
+
+If a Traefik-managed hostname already exists in Pi-hole pointing to a different IP, the script will:
+
+1. Log a `WARNING` with the hostname, old IP, and new Traefik IP
+2. Back up the current state (as usual)
+3. Remove the old entry and let the normal sync add the correct one
+
+This is enabled by default. To log conflicts without removing them, use:
+
+```bash
+python3 sync.py --no-replace-conflicts
+```
+
 ## Managed Entry Scope
 
-The script only manages DNS entries pointing to `TRAEFIK_IP`. Manual entries pointing to other IPs are never touched.
+The script only manages DNS entries pointing to `TRAEFIK_IP`. Manual entries pointing to other IPs are never touched, unless they conflict with a Traefik-managed hostname (see above).
 
 ## Requirements
 
