@@ -6,6 +6,12 @@ Polls the Traefik API for HTTP routers, extracts Host() hostnames, and pushes
 them to one or more Pi-hole v6 instances via the Pi-hole REST API.
 
 Configuration is via environment variables (see defaults below).
+
+Exit codes:
+  0 — Success (or no changes needed)
+  1 — Configuration error (missing required env vars)
+  2 — Traefik API unreachable or returned invalid data
+  3 — One or more Pi-hole instances failed during sync
 """
 
 import argparse
@@ -17,10 +23,17 @@ import os
 import re
 import sys
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+
+# Exit codes
+EXIT_OK = 0
+EXIT_CONFIG_ERROR = 1
+EXIT_TRAEFIK_ERROR = 2
+EXIT_PIHOLE_ERROR = 3
 
 # SSL context for Pi-hole self-signed certs
 _SSL_CTX = ssl.create_default_context()
@@ -47,6 +60,10 @@ CACHE_FILE = os.environ.get("CACHE_FILE", "/opt/traefik-dns-sync/.last_hash")
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "/opt/traefik-dns-sync/backups")
 BACKUP_RETAIN = int(os.environ.get("BACKUP_RETAIN", "10"))
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+
+# Retry settings
+RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "3"))
+RETRY_BACKOFF_BASE = float(os.environ.get("RETRY_BACKOFF_BASE", "2.0"))
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -88,16 +105,52 @@ def api_request(url, method="GET", data=None, headers=None, timeout=10):
         return 0, None
 
 
+def api_request_with_retry(url, method="GET", data=None, headers=None, timeout=10):
+    """Wrap api_request() with retry logic and exponential backoff.
+
+    Retries on network errors (status 0) and server errors (5xx).
+    Does NOT retry on client errors (4xx) — those indicate a real problem.
+    """
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        status, result = api_request(url, method=method, data=data, headers=headers, timeout=timeout)
+
+        # Success or client error — return immediately
+        if status != 0 and status < 500:
+            return status, result
+
+        # Retriable failure
+        if attempt < RETRY_ATTEMPTS:
+            delay = RETRY_BACKOFF_BASE ** (attempt - 1)  # 1s, 2s, 4s ...
+            log.warning(
+                "Attempt %d/%d failed for %s %s (status %d) — retrying in %.1fs",
+                attempt, RETRY_ATTEMPTS, method, url, status, delay,
+            )
+            time.sleep(delay)
+        else:
+            log.error(
+                "All %d attempts failed for %s %s (last status %d)",
+                RETRY_ATTEMPTS, method, url, status,
+            )
+
+    return status, result
+
+
 # ---------------------------------------------------------------------------
 # Traefik
 # ---------------------------------------------------------------------------
 def fetch_traefik_routers():
-    """GET /api/http/routers from Traefik. Returns list of router dicts."""
+    """GET /api/http/routers from Traefik. Returns list of router dicts or None on failure."""
     url = f"{TRAEFIK_URL}/api/http/routers"
-    status, data = api_request(url)
+    status, data = api_request_with_retry(url)
     if status != 200 or data is None:
         log.error("Failed to fetch Traefik routers (status %d)", status)
-        sys.exit(1)
+        return None
+
+    # Validate: response must be a list
+    if not isinstance(data, list):
+        log.error("Traefik returned unexpected data type (expected list, got %s)", type(data).__name__)
+        return None
+
     return data
 
 
@@ -176,29 +229,44 @@ def pihole_password_for(host):
     return os.environ.get(env_key, PIHOLE_PASSWORD)
 
 
+class PiholeAuthError(Exception):
+    """Raised when Pi-hole authentication fails."""
+    pass
+
+
 def pihole_authenticate(host):
     """
     POST /api/auth to obtain a session.
-    Returns (sid, headers_dict) or exits on failure.
+    Returns (sid, headers_dict).
+    Raises PiholeAuthError on failure instead of exiting.
     """
     url = f"{pihole_url(host)}/auth"
     password = pihole_password_for(host)
-    status, data = api_request(url, method="POST", data={"password": password})
+    status, data = api_request_with_retry(url, method="POST", data={"password": password})
     if status != 200 or data is None:
-        log.error("Auth failed for Pi-hole %s (status %d)", host, status)
-        sys.exit(1)
+        raise PiholeAuthError(f"Auth failed for Pi-hole {host} (status {status})")
 
     session = data.get("session", {})
     sid = session.get("sid")
     csrf = session.get("csrf")
     if not sid:
-        log.error("No SID returned from Pi-hole %s: %s", host, data)
-        sys.exit(1)
+        raise PiholeAuthError(f"No SID returned from Pi-hole {host}: {data}")
 
     headers = {"X-FTL-SID": sid}
     if csrf:
         headers["X-FTL-CSRF"] = csrf
     return sid, headers
+
+
+def pihole_logout(host, sid):
+    """DELETE /api/auth — clean up the Pi-hole session."""
+    url = f"{pihole_url(host)}/auth"
+    headers = {"X-FTL-SID": sid}
+    status, _ = api_request(url, method="DELETE", headers=headers)
+    if status in (200, 204, 410):
+        log.debug("Session cleaned up for Pi-hole %s", host)
+    else:
+        log.warning("Session cleanup returned status %d for Pi-hole %s", status, host)
 
 
 def pihole_get_hosts(host, headers):
@@ -207,24 +275,31 @@ def pihole_get_hosts(host, headers):
     that are currently configured on this Pi-hole.
     """
     url = f"{pihole_url(host)}/config/dns/hosts"
-    status, data = api_request(url, headers=headers)
+    status, data = api_request_with_retry(url, headers=headers)
     if status != 200 or data is None:
         log.error("Failed to fetch DNS hosts from Pi-hole %s (status %d)", host, status)
         return []
 
     # The API returns {"config": {"dns": {"hosts": ["ip host", ...]}}}
     try:
-        return data["config"]["dns"]["hosts"]
+        hosts = data["config"]["dns"]["hosts"]
     except (KeyError, TypeError):
         log.warning("Unexpected response structure from Pi-hole %s: %s", host, str(data)[:200])
         return []
+
+    # Validate: hosts must be a list
+    if not isinstance(hosts, list):
+        log.warning("Pi-hole %s returned non-list for hosts (got %s)", host, type(hosts).__name__)
+        return []
+
+    return hosts
 
 
 def pihole_add_host(host, headers, entry):
     """PUT /api/config/dns/hosts/{entry} — add a DNS record."""
     encoded = urllib.parse.quote(entry, safe="")
     url = f"{pihole_url(host)}/config/dns/hosts/{encoded}"
-    status, _ = api_request(url, method="PUT", headers=headers)
+    status, _ = api_request_with_retry(url, method="PUT", headers=headers)
     return status in (200, 201)
 
 
@@ -232,7 +307,7 @@ def pihole_delete_host(host, headers, entry):
     """DELETE /api/config/dns/hosts/{entry} — remove a DNS record."""
     encoded = urllib.parse.quote(entry, safe="")
     url = f"{pihole_url(host)}/config/dns/hosts/{encoded}"
-    status, _ = api_request(url, method="DELETE", headers=headers)
+    status, _ = api_request_with_retry(url, method="DELETE", headers=headers)
     return status in (200, 204)
 
 
@@ -281,28 +356,31 @@ def rollback(backup_file):
     for host in targets:
         log.info("Rolling back %s from %s ...", host, backup_file)
         sid, headers = pihole_authenticate(host)
-        current_entries = set(pihole_get_hosts(host, headers))
+        try:
+            current_entries = set(pihole_get_hosts(host, headers))
 
-        to_add = backed_up_entries - current_entries
-        to_remove = current_entries - backed_up_entries
+            to_add = backed_up_entries - current_entries
+            to_remove = current_entries - backed_up_entries
 
-        for entry in sorted(to_add):
-            if DRY_RUN:
-                log.info("[DRY RUN] Would restore to %s: %s", host, entry)
-            elif pihole_add_host(host, headers, entry):
-                log.info("Restored to %s: %s", host, entry)
-            else:
-                log.error("Failed to restore to %s: %s", host, entry)
+            for entry in sorted(to_add):
+                if DRY_RUN:
+                    log.info("[DRY RUN] Would restore to %s: %s", host, entry)
+                elif pihole_add_host(host, headers, entry):
+                    log.info("Restored to %s: %s", host, entry)
+                else:
+                    log.error("Failed to restore to %s: %s", host, entry)
 
-        for entry in sorted(to_remove):
-            if DRY_RUN:
-                log.info("[DRY RUN] Would remove from %s: %s", host, entry)
-            elif pihole_delete_host(host, headers, entry):
-                log.info("Removed from %s: %s", host, entry)
-            else:
-                log.error("Failed to remove from %s: %s", host, entry)
+            for entry in sorted(to_remove):
+                if DRY_RUN:
+                    log.info("[DRY RUN] Would remove from %s: %s", host, entry)
+                elif pihole_delete_host(host, headers, entry):
+                    log.info("Removed from %s: %s", host, entry)
+                else:
+                    log.error("Failed to remove from %s: %s", host, entry)
 
-        log.info("Rollback complete for %s: +%d -%d", host, len(to_add), len(to_remove))
+            log.info("Rollback complete for %s: +%d -%d", host, len(to_add), len(to_remove))
+        finally:
+            pihole_logout(host, sid)
 
 
 # ---------------------------------------------------------------------------
@@ -312,49 +390,53 @@ def sync_pihole(host, desired_hostnames):
     """
     Sync the desired hostname set to a single Pi-hole instance.
     Returns (added_list, removed_list, had_errors).
+    Raises PiholeAuthError if authentication fails.
     """
     sid, headers = pihole_authenticate(host)
-    current_entries = pihole_get_hosts(host, headers)
+    try:
+        current_entries = pihole_get_hosts(host, headers)
 
-    # Backup current state before making changes
-    backup_pihole_hosts(host, headers)
+        # Backup current state before making changes
+        backup_pihole_hosts(host, headers)
 
-    # Build sets for comparison — only consider entries matching TRAEFIK_IP
-    desired_entries = {f"{TRAEFIK_IP} {h}" for h in desired_hostnames}
-    current_traefik = {e for e in current_entries if e.startswith(f"{TRAEFIK_IP} ")}
+        # Build sets for comparison — only consider entries matching TRAEFIK_IP
+        desired_entries = {f"{TRAEFIK_IP} {h}" for h in desired_hostnames}
+        current_traefik = {e for e in current_entries if e.startswith(f"{TRAEFIK_IP} ")}
 
-    to_add = desired_entries - current_traefik
-    to_remove = current_traefik - desired_entries
+        to_add = desired_entries - current_traefik
+        to_remove = current_traefik - desired_entries
 
-    added = []
-    removed = []
-    errors = False
+        added = []
+        removed = []
+        errors = False
 
-    for entry in sorted(to_add):
-        if DRY_RUN:
-            log.info("[DRY RUN] Would add to %s: %s", host, entry)
-        else:
-            if pihole_add_host(host, headers, entry):
-                log.debug("Added to %s: %s", host, entry)
+        for entry in sorted(to_add):
+            if DRY_RUN:
+                log.info("[DRY RUN] Would add to %s: %s", host, entry)
             else:
-                log.error("Failed to add to %s: %s", host, entry)
-                errors = True
-                continue
-        added.append(entry.split(" ", 1)[1])
+                if pihole_add_host(host, headers, entry):
+                    log.debug("Added to %s: %s", host, entry)
+                else:
+                    log.error("Failed to add to %s: %s", host, entry)
+                    errors = True
+                    continue
+            added.append(entry.split(" ", 1)[1])
 
-    for entry in sorted(to_remove):
-        if DRY_RUN:
-            log.info("[DRY RUN] Would remove from %s: %s", host, entry)
-        else:
-            if pihole_delete_host(host, headers, entry):
-                log.debug("Removed from %s: %s", host, entry)
+        for entry in sorted(to_remove):
+            if DRY_RUN:
+                log.info("[DRY RUN] Would remove from %s: %s", host, entry)
             else:
-                log.error("Failed to remove from %s: %s", host, entry)
-                errors = True
-                continue
-        removed.append(entry.split(" ", 1)[1])
+                if pihole_delete_host(host, headers, entry):
+                    log.debug("Removed from %s: %s", host, entry)
+                else:
+                    log.error("Failed to remove from %s: %s", host, entry)
+                    errors = True
+                    continue
+            removed.append(entry.split(" ", 1)[1])
 
-    return added, removed, errors
+        return added, removed, errors
+    finally:
+        pihole_logout(host, sid)
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +446,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Sync Traefik router hostnames to Pi-hole v6 local DNS.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog="""\
 environment variables:
   TRAEFIK_URL          Traefik API base URL (default: http://127.0.0.1:8080)
   TRAEFIK_IP           IP address of your Traefik instance (required)
@@ -379,6 +461,14 @@ environment variables:
   BACKUP_RETAIN        Number of backups to keep per Pi-hole host (default: 10)
   DRY_RUN              Set to 'true' to preview changes without applying (default: false)
   DEBUG                Set to any value to enable debug logging
+  RETRY_ATTEMPTS       Number of retry attempts for failed requests (default: 3)
+  RETRY_BACKOFF_BASE   Base for exponential backoff in seconds (default: 2.0)
+
+exit codes:
+  0  Success (or no changes needed)
+  1  Configuration error (missing required env vars)
+  2  Traefik API unreachable or returned invalid data
+  3  One or more Pi-hole instances failed during sync
 
 examples:
   # Normal sync (e.g. from cron)
@@ -419,17 +509,17 @@ def main():
     # Verify required configuration
     if not TRAEFIK_IP:
         log.error("TRAEFIK_IP is not set")
-        sys.exit(1)
+        sys.exit(EXIT_CONFIG_ERROR)
     if not PIHOLE_HOSTS:
         log.error("PIHOLE_HOSTS is not set")
-        sys.exit(1)
+        sys.exit(EXIT_CONFIG_ERROR)
     has_password = bool(PIHOLE_PASSWORD) or any(
         os.environ.get(f"PIHOLE_PASSWORD_{h.replace('.', '_')}")
         for h in PIHOLE_HOSTS
     )
     if not has_password:
         log.error("No Pi-hole password configured. Set PIHOLE_PASSWORD or per-instance PIHOLE_PASSWORD_<IP>.")
-        sys.exit(1)
+        sys.exit(EXIT_CONFIG_ERROR)
 
     # --list-backups: show available backups and exit
     if args.list_backups:
@@ -449,6 +539,9 @@ def main():
 
     # Step 1: Fetch routers from Traefik
     routers = fetch_traefik_routers()
+    if routers is None:
+        log.error("Cannot reach Traefik API — aborting (cache untouched)")
+        sys.exit(EXIT_TRAEFIK_ERROR)
     log.debug("Fetched %d routers from Traefik", len(routers))
 
     # Step 2: Extract and filter hostnames
@@ -461,25 +554,35 @@ def main():
         log.info("NO CHANGE (%d hostnames)", len(hostnames))
         return
 
-    # Step 4: Sync to each Pi-hole instance
+    # Step 4: Sync to each Pi-hole instance (per-instance resilience)
     all_added = []
     all_removed = []
-    had_errors = False
+    failed_hosts = []
 
     for host in PIHOLE_HOSTS:
         log.info("Syncing to Pi-hole %s ...", host)
-        added, removed, errors = sync_pihole(host, hostnames)
-        all_added.extend(added)
-        all_removed.extend(removed)
-        if errors:
-            had_errors = True
+        try:
+            added, removed, errors = sync_pihole(host, hostnames)
+            all_added.extend(added)
+            all_removed.extend(removed)
+            if errors:
+                failed_hosts.append(host)
+        except PiholeAuthError as e:
+            log.error("Skipping Pi-hole %s: %s", host, e)
+            failed_hosts.append(host)
+        except Exception as e:
+            log.error("Unexpected error syncing to Pi-hole %s: %s", host, e)
+            failed_hosts.append(host)
 
-    # Step 5: Update cache and prune old backups (skip cache on errors so next run retries)
+    # Step 5: Update cache and prune old backups
     if not DRY_RUN:
-        if not had_errors:
+        if not failed_hosts:
             save_cache(current_hash)
         else:
-            log.warning("Errors occurred during sync — cache NOT updated (will retry next run)")
+            log.warning(
+                "Errors on %d/%d Pi-hole(s) (%s) — cache NOT updated (will retry next run)",
+                len(failed_hosts), len(PIHOLE_HOSTS), ", ".join(failed_hosts),
+            )
         prune_backups()
 
     # Step 6: Log summary
@@ -492,6 +595,9 @@ def main():
         ", ".join(added_unique) if added_unique else "(none)",
         ", ".join(removed_unique) if removed_unique else "(none)",
     )
+
+    if failed_hosts:
+        sys.exit(EXIT_PIHOLE_ERROR)
 
 
 if __name__ == "__main__":
