@@ -31,9 +31,11 @@ When services are added or removed behind Traefik, this script polls the Traefik
 # 1. Clone to your Traefik host
 git clone https://github.com/jonnewman85/traefik-pihole-sync.git /opt/traefik-dns-sync
 
-# 2. Create .env with your Pi-hole app passwords
+# 2. Create .env with your settings
 cat > /opt/traefik-dns-sync/.env << 'EOF'
-PIHOLE_PASSWORD_192_168_1_2="your-app-password-for-pihole-1"
+TRAEFIK_IP="192.168.1.1"                                    # IP of your Traefik host
+PIHOLE_HOSTS="192.168.1.2,192.168.1.3"                       # Comma-separated Pi-hole IPs
+PIHOLE_PASSWORD_192_168_1_2="your-app-password-for-pihole-1"  # Per-instance app passwords
 PIHOLE_PASSWORD_192_168_1_3="your-app-password-for-pihole-2"
 EOF
 chmod 600 /opt/traefik-dns-sync/.env
@@ -135,6 +137,14 @@ Other scripts that solve this problem tend to be Docker-first Go applications wi
 | **Router filtering** | Auto-excludes `@internal`, configurable blocklist | No filtering |
 | **Scheduling** | System cron (external) | Built-in cron scheduler |
 | **Runtime requirements** | Python 3.6+ | Docker |
+
+## Tested On
+
+This script has been tested on a clean Debian 13 installation with Traefik running as a native systemd service:
+
+- **Traefik 3.6.7** (codename: ramequin), built 2026-01-14, Go 1.24.11
+- **Systemd service**: `/etc/systemd/system/traefik.service` running `/usr/bin/traefik --configFile=/etc/traefik/traefik.yaml`
+- **Pi-hole v6** on two separate instances
 
 ## License
 
