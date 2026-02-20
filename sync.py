@@ -386,11 +386,14 @@ def rollback(backup_file):
 # ---------------------------------------------------------------------------
 # Sync logic
 # ---------------------------------------------------------------------------
-def sync_pihole(host, desired_hostnames):
+def sync_pihole(host, desired_hostnames, replace_conflicts=True):
     """
     Sync the desired hostname set to a single Pi-hole instance.
-    Returns (added_list, removed_list, had_errors).
+    Returns (added_list, removed_list, conflict_list, had_errors).
     Raises PiholeAuthError if authentication fails.
+
+    If replace_conflicts is True, existing DNS entries for Traefik-managed
+    hostnames that point to a different IP will be removed and replaced.
     """
     sid, headers = pihole_authenticate(host)
     try:
@@ -398,6 +401,40 @@ def sync_pihole(host, desired_hostnames):
 
         # Backup current state before making changes
         backup_pihole_hosts(host, headers)
+
+        # Build a map of hostname -> list of IPs from current entries
+        current_by_hostname = {}
+        for entry in current_entries:
+            parts = entry.split(" ", 1)
+            if len(parts) == 2:
+                current_by_hostname.setdefault(parts[1], []).append(parts[0])
+
+        # Detect and handle conflicting entries (same hostname, different IP)
+        conflicts = []
+        for hostname in desired_hostnames:
+            existing_ips = current_by_hostname.get(hostname, [])
+            for ip in existing_ips:
+                if ip != TRAEFIK_IP:
+                    old_entry = f"{ip} {hostname}"
+                    conflicts.append(old_entry)
+                    if replace_conflicts:
+                        if DRY_RUN:
+                            log.warning(
+                                "[DRY RUN] CONFLICT on %s: %s points to %s (would replace with %s)",
+                                host, hostname, ip, TRAEFIK_IP,
+                            )
+                        else:
+                            log.warning(
+                                "CONFLICT on %s: %s points to %s — replacing with %s",
+                                host, hostname, ip, TRAEFIK_IP,
+                            )
+                            if not pihole_delete_host(host, headers, old_entry):
+                                log.error("Failed to remove conflicting entry from %s: %s", host, old_entry)
+                    else:
+                        log.warning(
+                            "CONFLICT on %s: %s points to %s (not replacing — use default or omit --no-replace-conflicts)",
+                            host, hostname, ip,
+                        )
 
         # Build sets for comparison — only consider entries matching TRAEFIK_IP
         desired_entries = {f"{TRAEFIK_IP} {h}" for h in desired_hostnames}
@@ -434,7 +471,7 @@ def sync_pihole(host, desired_hostnames):
                     continue
             removed.append(entry.split(" ", 1)[1])
 
-        return added, removed, errors
+        return added, removed, conflicts, errors
     finally:
         pihole_logout(host, sid)
 
@@ -500,6 +537,11 @@ examples:
         action="store_true",
         help="List available backup files and exit.",
     )
+    parser.add_argument(
+        "--no-replace-conflicts",
+        action="store_true",
+        help="Log conflicting DNS entries but do not remove them. By default, entries for Traefik-managed hostnames pointing to a different IP are replaced.",
+    )
     return parser.parse_args()
 
 
@@ -555,16 +597,19 @@ def main():
         return
 
     # Step 4: Sync to each Pi-hole instance (per-instance resilience)
+    replace_conflicts = not args.no_replace_conflicts
     all_added = []
     all_removed = []
+    all_conflicts = []
     failed_hosts = []
 
     for host in PIHOLE_HOSTS:
         log.info("Syncing to Pi-hole %s ...", host)
         try:
-            added, removed, errors = sync_pihole(host, hostnames)
+            added, removed, conflicts, errors = sync_pihole(host, hostnames, replace_conflicts)
             all_added.extend(added)
             all_removed.extend(removed)
+            all_conflicts.extend(conflicts)
             if errors:
                 failed_hosts.append(host)
         except PiholeAuthError as e:
@@ -588,10 +633,13 @@ def main():
     # Step 6: Log summary
     added_unique = sorted(set(all_added))
     removed_unique = sorted(set(all_removed))
+    conflict_unique = sorted(set(all_conflicts))
+    summary = "SYNC: +%d -%d" % (len(added_unique), len(removed_unique))
+    if conflict_unique:
+        summary += " ~%d conflicts" % len(conflict_unique)
     log.info(
-        "SYNC: +%d -%d | added: %s | removed: %s",
-        len(added_unique),
-        len(removed_unique),
+        "%s | added: %s | removed: %s",
+        summary,
         ", ".join(added_unique) if added_unique else "(none)",
         ", ".join(removed_unique) if removed_unique else "(none)",
     )
