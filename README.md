@@ -31,7 +31,7 @@ When services are added or removed behind Traefik, this script polls the Traefik
 
 ```bash
 # 1. Clone to your Traefik host
-git clone https://github.com/jonnewman85/traefik-pihole-sync.git /opt/traefik-dns-sync
+git clone https://github.com/jonmilele/traefik-pihole-sync.git /opt/traefik-dns-sync
 
 # 2. Create .env with your settings
 cat > /opt/traefik-dns-sync/.env << 'EOF'
